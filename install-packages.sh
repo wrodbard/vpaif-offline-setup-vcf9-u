@@ -1,4 +1,4 @@
-#!/bin/bash
+ #!/bin/bash
 
 # ==============================================================================
 # VCF 9 & Private AI - Air Gap Preparation (Direct Artifactory Method)
