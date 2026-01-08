@@ -10,10 +10,9 @@ else
     exit 1
 fi
 
-# Define VCF CLI Versions (Update these as new versions release)
+# Define VCF CLI Versions
 VCF_CLI_VERSION="v9.0.0"
 VCF_CLI_URL="https://packages.broadcom.com/artifactory/vcf-distro/vcf-cli/linux/amd64/${VCF_CLI_VERSION}/vcf-cli.tar.gz"
-# Note: Verify the exact bundle filename on the Broadcom portal if the download fails
 VCF_PLUGIN_BUNDLE_URL="https://packages.broadcom.com/artifactory/vcf-distro/vcf-cli-plugins/${VCF_CLI_VERSION}/VCF-Consumption-CLI-PluginBundle-Linux_AMD64.tar.gz"
 
 echo "Updating apt and installing apt-mirror..."
@@ -25,7 +24,8 @@ if [ -f "/etc/apt/mirror.list" ]; then
     mv /etc/apt/mirror.list /etc/apt/mirror.list-bak
 fi
 
-# Create mirror.list file with 64-bit (amd64) restriction
+# Create mirror.list file - SLIM VERSION
+# REMOVED: universe, multiverse, backports to save ~600GB
 cat > /etc/apt/mirror.list << EOF
 ############# config ##################
 #
@@ -37,15 +37,32 @@ set defaultarch amd64
 #
 ############# end config ##############
 
-deb http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu jammy-security main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse
-#deb http://archive.ubuntu.com/ubuntu jammy-proposed main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu jammy-backports main restricted universe multiverse
+# -- CORE REPOSITORIES (Required) --
+deb http://archive.ubuntu.com/ubuntu jammy main restricted
+deb http://archive.ubuntu.com/ubuntu jammy-security main restricted
+deb http://archive.ubuntu.com/ubuntu jammy-updates main restricted
+
+# -- OPTIONAL / BLOAT (Uncomment only if strictly needed) --
+# 'Universe' contains community maintained software (HUGE SIZE)
+# deb http://archive.ubuntu.com/ubuntu jammy universe multiverse
+# deb http://archive.ubuntu.com/ubuntu jammy-security universe multiverse
+# deb http://archive.ubuntu.com/ubuntu jammy-updates universe multiverse
+
+# 'Backports' contains newer, less stable software
+# deb http://archive.ubuntu.com/ubuntu jammy-backports main restricted universe multiverse
+
+# Clean up old packages after mirroring
+set cleanscript $BASTION_REPO_DIR/var/clean.sh
 EOF
 
 echo "Starting apt-mirror..."
 apt-mirror
+
+# Run the clean script if it exists to free up space from previous runs
+if [ -f "$BASTION_REPO_DIR/var/clean.sh" ]; then
+    echo "Cleaning up obsolete packages..."
+    /bin/bash "$BASTION_REPO_DIR/var/clean.sh"
+fi
 
 # ------------------------------------------------------------------
 # Manual Fixes & Ubuntu Icons/CNF
@@ -55,8 +72,9 @@ base_dir="$BASTION_REPO_DIR/mirror/archive.ubuntu.com/ubuntu/dists"
 
 if [ -d "$base_dir" ]; then
     cd $base_dir
-    for dist in jammy jammy-updates jammy-security jammy-backports; do
-      for comp in main multiverse universe; do
+    # Only loop through core dists, skipping backports if not used above
+    for dist in jammy jammy-updates jammy-security; do
+      for comp in main restricted; do
         mkdir -p "$dist/$comp/dep11"
         for size in 48 64 128; do
             wget -q "http://archive.ubuntu.com/ubuntu/dists/$dist/$comp/dep11/icons-${size}x${size}@2.tar.gz" -O "$dist/$comp/dep11/icons-${size}x${size}@2.tar.gz"
@@ -68,8 +86,8 @@ else
 fi
 
 cd /var/tmp
-# Download commands and binaries (AMD64 ONLY)
-for p in "${1:-jammy}"{,-{security,updates,backports}}/{main,restricted,universe,multiverse}; do
+# Download commands (AMD64 ONLY) - reduced scope
+for p in "${1:-jammy}"{,-{security,updates}}/{main,restricted}; do
   >&2 echo "Processing: ${p}"
   wget -q -c -r -np -R "index.html*" "http://archive.ubuntu.com/ubuntu/dists/${p}/cnf/Commands-amd64.xz"
 done
@@ -82,41 +100,36 @@ cp -av archive.ubuntu.com/ubuntu/ "$BASTION_REPO_DIR/mirror/archive.ubuntu.com/u
 # ------------------------------------------------------------------
 echo "Starting VCF-CLI and Offline Bundle download..."
 
-# Create directory for VCF tools in the repo
 VCF_REPO_DIR="$BASTION_REPO_DIR/vcf-cli"
 mkdir -p "$VCF_REPO_DIR"
 cd "$VCF_REPO_DIR"
 
-# 1. Download VCF CLI Binary
 echo "Downloading VCF-CLI binary..."
 wget -q -c "$VCF_CLI_URL" -O vcf-cli.tar.gz
 
-# 2. Download VCF CLI Offline Plugin Bundle
 echo "Downloading VCF-CLI Plugin Bundle..."
 wget -q -c "$VCF_PLUGIN_BUNDLE_URL" -O vcf-plugins-bundle.tar.gz
 
-# 3. Install VCF-CLI on this Bastion Host
 echo "Installing VCF-CLI locally on Bastion..."
-# Extract and install binary
 tar -xf vcf-cli.tar.gz
-chmod +x vcf-cli-linux-amd64
-mv vcf-cli-linux-amd64 /usr/local/bin/vcf
+# Handle potentially different internal folder naming in tarball
+if [ -f "vcf-cli-linux-amd64" ]; then
+    chmod +x vcf-cli-linux-amd64
+    mv vcf-cli-linux-amd64 /usr/local/bin/vcf
+elif [ -f "vcf-cli" ]; then
+    chmod +x vcf-cli
+    mv vcf-cli /usr/local/bin/vcf
+fi
 
-# 4. Install Plugins from the downloaded Offline Bundle
 if command -v vcf &> /dev/null; then
     echo "VCF-CLI installed successfully. Installing plugins from offline bundle..."
-    # Create a temp dir to extract the bundle for installation
     mkdir -p /tmp/vcf-bundle
     tar -xf vcf-plugins-bundle.tar.gz -C /tmp/vcf-bundle
-    
-    # Install all plugins using local source
     vcf plugin install all --local-source /tmp/vcf-bundle
-    
-    # Cleanup temp bundle extraction
     rm -rf /tmp/vcf-bundle
     echo "VCF-CLI plugins installed."
 else
-    echo "Error: VCF-CLI binary install failed."
+    echo "Error: VCF-CLI binary install failed or binary name changed."
 fi
 
 # ------------------------------------------------------------------
@@ -124,10 +137,10 @@ fi
 # ------------------------------------------------------------------
 if [[ $SYNC_DIRECTORIES == "True" ]]; then
   echo "Syncing Ubuntu Mirror to remote server..."
-  sshpass -p "$HTTP_PASSWORD" rsync -avz "$BASTION_REPO_DIR/mirror/archive.ubuntu.com/ubuntu" "$HTTP_USERNAME@$HTTP_HOST:$REPO_LOCATION/debs"
+  # Use --delete to remove files on the remote side that are no longer in our local mirror (crucial for size reduction)
+  sshpass -p "$HTTP_PASSWORD" rsync -avz --delete "$BASTION_REPO_DIR/mirror/archive.ubuntu.com/ubuntu" "$HTTP_USERNAME@$HTTP_HOST:$REPO_LOCATION/debs"
   
   echo "Syncing VCF-CLI files to remote server..."
-  # Assuming you want the VCF tools in a 'tools' or 'vcf' directory on the remote host
   sshpass -p "$HTTP_PASSWORD" rsync -avz "$VCF_REPO_DIR" "$HTTP_USERNAME@$HTTP_HOST:$REPO_LOCATION/tools"
 fi
 
