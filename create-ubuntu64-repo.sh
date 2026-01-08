@@ -1,10 +1,6 @@
 #!/bin/bash
 # ---------------------------------------------------------------------------------
-# SMART UBUNTU MIRROR & VCF SETUP SCRIPT
-# ---------------------------------------------------------------------------------
-# BEHAVIOR:
-# 1. Fresh Run: Sets up repo, installs dependencies, downloads ~120GB Core OS.
-# 2. Subsequent/Dirty Run: Detects 600GB+ bloat (Universe/Multiverse) and deletes it.
+# DEEP CLEAN & SYNC SCRIPT (Standard ~120GB Target)
 # ---------------------------------------------------------------------------------
 set -o pipefail
 
@@ -22,43 +18,57 @@ VCF_CLI_URL="https://packages.broadcom.com/artifactory/vcf-distro/vcf-cli/linux/
 VCF_PLUGIN_BUNDLE_URL="https://packages.broadcom.com/artifactory/vcf-distro/vcf-cli-plugins/${VCF_CLI_VERSION}/VCF-Consumption-CLI-PluginBundle-Linux_AMD64.tar.gz"
 
 # ---------------------------------------------------------------------------------
-# PRE-FLIGHT CHECKS & INSTALLS
+# STEP 1: LOCATE AND DESTROY BLOAT
 # ---------------------------------------------------------------------------------
-echo "[1/7] Checking dependencies..."
-if ! command -v apt-mirror &> /dev/null; then
-    echo "  -> apt-mirror not found. Installing..."
-    apt update && apt install -y apt-mirror rsync sshpass
-else
-    echo "  -> Dependencies okay."
-fi
-
-# ---------------------------------------------------------------------------------
-# INTELLIGENT CLEANUP ("The Nuclear Option")
-# ---------------------------------------------------------------------------------
-echo "[2/7] Checking repository state..."
 REPO_ROOT="$BASTION_REPO_DIR/mirror/archive.ubuntu.com/ubuntu"
 
-# Check if we have bloat from a previous configuration
-if [ -d "$REPO_ROOT/pool/universe" ] || [ -d "$REPO_ROOT/pool/multiverse" ]; then
-    echo "  !! DETECTED OLD BLOAT (Universe/Multiverse) !!"
-    echo "  !! GOING NUCLEAR: Deleting massive community repos to save space... !!"
+echo "====================================================================="
+echo "DIAGNOSTIC: Checking storage usage..."
+echo "====================================================================="
+
+if [ -d "$REPO_ROOT/pool" ]; then
+    # Calculate sizes of the specific components
+    echo "Checking size of 'Universe' (Community - likely huge)..."
+    du -sh "$REPO_ROOT/pool/universe" 2>/dev/null || echo "Universe not found."
+
+    echo "Checking size of 'Multiverse' (Non-Free)..."
+    du -sh "$REPO_ROOT/pool/multiverse" 2>/dev/null || echo "Multiverse not found."
     
-    # Remove safely without failing if one doesn't exist
-    rm -rf "$REPO_ROOT/pool/universe"
-    rm -rf "$REPO_ROOT/pool/multiverse"
-    # Force removal of dists to ensure apt-mirror rebuilds the index map
-    rm -rf "$REPO_ROOT/dists/*universe*"
-    rm -rf "$REPO_ROOT/dists/*multiverse*"
+    echo "Checking size of 'Backports'..."
+    du -sh "$REPO_ROOT/pool/main/b/backports-*" 2>/dev/null || echo "Backports not found."
+
+    echo "---------------------------------------------------------------------"
+    echo "PERFORMING DEEP CLEAN..."
     
-    echo "  -> Cleanup complete. Repository stripped to Core components."
+    # FORCE DELETE
+    # We remove these folders entirely. apt-mirror will recreate 'main'/'restricted' 
+    # but will NOT recreate these because they are removed from the config below.
+    
+    if [ -d "$REPO_ROOT/pool/universe" ]; then
+        echo "  -> Removing Universe... (This frees the most space)"
+        rm -rf "$REPO_ROOT/pool/universe"
+    fi
+    
+    if [ -d "$REPO_ROOT/pool/multiverse" ]; then
+        echo "  -> Removing Multiverse..."
+        rm -rf "$REPO_ROOT/pool/multiverse"
+    fi
+
+    # Also remove the index files that list these packages
+    rm -rf "$REPO_ROOT/dists/"*universe*
+    rm -rf "$REPO_ROOT/dists/"*multiverse*
+    
+    echo "  -> Cleanup Finished."
 else
-    echo "  -> Repository looks clean (or is empty). Skipping cleanup."
+    echo "Repo directory not created yet. Proceeding with fresh install."
 fi
 
 # ---------------------------------------------------------------------------------
-# CONFIGURE APT-MIRROR (Strict 64-bit Core)
+# STEP 2: CONFIGURE APT-MIRROR (Strict Main/Restricted)
 # ---------------------------------------------------------------------------------
-echo "[3/7] Configuring mirror list..."
+echo "Configuring apt-mirror for 64-bit Core Only..."
+
+# Backup existing list
 [ -f "/etc/apt/mirror.list" ] && mv /etc/apt/mirror.list /etc/apt/mirror.list-bak
 
 cat > /etc/apt/mirror.list << EOF
@@ -69,54 +79,49 @@ set _tilde 0
 set defaultarch amd64
 ############# end config ##############
 
-# -- CORE REPOSITORIES ONLY (~120GB) --
+# -- CORE REPOSITORIES ONLY --
+# Only 'main' and 'restricted'. NO universe. NO multiverse.
 deb http://archive.ubuntu.com/ubuntu jammy main restricted
 deb http://archive.ubuntu.com/ubuntu jammy-security main restricted
 deb http://archive.ubuntu.com/ubuntu jammy-updates main restricted
 
-# Clean rule (Generates removal script for old packages)
+# Clean rule
 clean http://archive.ubuntu.com/ubuntu
 EOF
 
 # ---------------------------------------------------------------------------------
-# RUN MIRROR
+# STEP 3: RUN SYNC
 # ---------------------------------------------------------------------------------
-echo "[4/7] syncing mirror (This may take time)..."
+echo "Starting Sync..."
 apt-mirror
 
-# Run the cleaner script if apt-mirror generated one
+# Run the internal clean script (deletes orphaned files from 'main' if any)
 CLEAN_SCRIPT="$BASTION_REPO_DIR/var/clean.sh"
 if [ -f "$CLEAN_SCRIPT" ]; then
-    echo "  -> Running post-mirror cleanup script..."
+    echo "Running apt-mirror post-clean script..."
     /bin/bash "$CLEAN_SCRIPT"
 fi
 
 # ---------------------------------------------------------------------------------
-# MANUAL FIXES (Icons & CNF Metadata)
+# STEP 4: MANUAL FIXES (Icons & CNF)
 # ---------------------------------------------------------------------------------
-echo "[5/7] Downloading metadata (Icons & CNF)..."
+echo "Downloading metadata..."
 base_dir="$REPO_ROOT/dists"
 
-# Only attempt to cd if the directory was actually created by apt-mirror
 if [ -d "$base_dir" ]; then
     cd "$base_dir"
     for dist in jammy jammy-updates jammy-security; do
       for comp in main restricted; do
         mkdir -p "$dist/$comp/dep11"
         for size in 48 64 128; do
-            # -N only downloads if newer than local file
             wget -q -N "http://archive.ubuntu.com/ubuntu/dists/$dist/$comp/dep11/icons-${size}x${size}@2.tar.gz" -O "$dist/$comp/dep11/icons-${size}x${size}@2.tar.gz"
         done
       done
     done
-else
-    echo "  -> Warning: Mirror directory not found. Skipping metadata fix."
 fi
 
-# Download CNF (Command Not Found) data
 cd /var/tmp
 for p in "${1:-jammy}"{,-{security,updates}}/{main,restricted}; do
-  # -c continues download, -N checks timestamp
   wget -q -c -r -np -R "index.html*" "http://archive.ubuntu.com/ubuntu/dists/${p}/cnf/Commands-amd64.xz"
 done
 
@@ -125,66 +130,41 @@ if [ -d "archive.ubuntu.com/ubuntu/" ]; then
 fi
 
 # ---------------------------------------------------------------------------------
-# VCF-CLI SETUP
+# STEP 5: VCF-CLI SETUP
 # ---------------------------------------------------------------------------------
-echo "[6/7] Setting up VCF-CLI..."
+echo "Setting up VCF-CLI..."
 VCF_REPO_DIR="$BASTION_REPO_DIR/vcf-cli"
 mkdir -p "$VCF_REPO_DIR"
 cd "$VCF_REPO_DIR"
 
-# Download only if file doesn't exist or is incomplete
 if [ ! -f "vcf-cli.tar.gz" ]; then
-    echo "  -> Downloading VCF-CLI..."
     wget -q -c "$VCF_CLI_URL" -O vcf-cli.tar.gz
 fi
-
 if [ ! -f "vcf-plugins-bundle.tar.gz" ]; then
-    echo "  -> Downloading VCF Plugin Bundle..."
     wget -q -c "$VCF_PLUGIN_BUNDLE_URL" -O vcf-plugins-bundle.tar.gz
 fi
 
-# Install/Update VCF-CLI on local machine
-echo "  -> Installing VCF-CLI locally..."
 tar -xf vcf-cli.tar.gz
-
-# Robust Binary Finder (Handles "vcf-cli-linux-amd64" or "vcf-cli" or other names)
 BINARY_FOUND=$(find . -maxdepth 2 -type f -name "vcf-cli*" ! -name "*.tar.gz" | head -n 1)
 
 if [ -n "$BINARY_FOUND" ]; then
     chmod +x "$BINARY_FOUND"
     cp "$BINARY_FOUND" /usr/local/bin/vcf
-    
-    echo "  -> Installing Plugins from Offline Bundle..."
     mkdir -p /tmp/vcf-bundle
     tar -xf vcf-plugins-bundle.tar.gz -C /tmp/vcf-bundle
-    
-    # Suppress output unless error
-    if vcf plugin install all --local-source /tmp/vcf-bundle > /dev/null; then
-         echo "  -> Plugins installed successfully."
-    else
-         echo "  -> Warning: Plugin installation reported issues."
-    fi
+    vcf plugin install all --local-source /tmp/vcf-bundle > /dev/null 2>&1
     rm -rf /tmp/vcf-bundle
-else
-    echo "  -> ERROR: Could not locate extracted VCF binary. Check download."
 fi
 
 # ---------------------------------------------------------------------------------
-# REMOTE SYNC
+# STEP 6: REMOTE SYNC (With DELETE)
 # ---------------------------------------------------------------------------------
 if [[ $SYNC_DIRECTORIES == "True" ]]; then
-  echo "[7/7] Syncing to remote server..."
-  
-  # Ensure the remote parent directories exist
-  # (Optional safety step, depends on remote setup)
-  
-  echo "  -> Syncing Ubuntu Mirror (Deleting remote bloat if present)..."
+  echo "Syncing to remote (DELETING REMOTE BLOAT)..."
   sshpass -p "$HTTP_PASSWORD" rsync -avz --delete "$REPO_ROOT/" "$HTTP_USERNAME@$HTTP_HOST:$REPO_LOCATION/debs/ubuntu"
-  
-  echo "  -> Syncing VCF Tools..."
   sshpass -p "$HTTP_PASSWORD" rsync -avz "$VCF_REPO_DIR" "$HTTP_USERNAME@$HTTP_HOST:$REPO_LOCATION/tools"
 fi
 
-echo "----------------------------------------------------------------"
-echo "SUCCESS: Mirror Sync & VCF Setup Completed."
-echo "----------------------------------------------------------------"
+echo "====================================================================="
+echo "DONE. Check size now with: du -sh $REPO_ROOT"
+echo "====================================================================="
